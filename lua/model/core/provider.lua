@@ -149,7 +149,7 @@ local function create_prompt_handlers(prompt, seg)
         seg.set_text(prompt.transform(complete_text))
       end
 
-      if reason == nil or reason == 'stop' then
+      if reason == nil or reason == 'stop' or reason == 'end_turn' then
         seg.clear_hl()
       elseif reason == 'length' then
         seg.highlight('Error')

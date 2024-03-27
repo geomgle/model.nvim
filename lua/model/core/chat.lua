@@ -278,7 +278,12 @@ function M.run_chat(opts)
 
       seg.clear_hl()
 
-      if reason and reason ~= 'stop' and reason ~= 'done' then
+      if
+        reason
+        and reason ~= 'stop'
+        and reason ~= 'done'
+        and reason ~= 'end_turn'
+      then
         util.notify(reason)
       end
     end,

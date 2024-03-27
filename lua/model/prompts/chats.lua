@@ -1,4 +1,6 @@
 local openai = require('model.providers.openai')
+local anthropic = require('model.providers.anthropic')
+local tabby = require('model.providers.tabby')
 local palm = require('model.providers.palm')
 local llamacpp = require('model.providers.llamacpp')
 local ollama = require('model.providers.ollama')
