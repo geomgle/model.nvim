@@ -1,124 +1,164 @@
 local util = require('model.util')
-local curl = require('model.util.curl')
-local prompts = require('model.util.prompts')
-local async = require('model.util.async')
-local provider_util = require('model.providers.util')
-local mode = require('model').mode
+local sse = require('model.util.sse')
 
--- TODO convert this to just an async prompt builder
-
---- This is a llamacpp based provider that only supports infill with codellama 7b and 13b, which require special token handling.
---- Note that the base models seem to perform better than Instruct models. I'm also not sure how to actually add instructions to a FIM prompt.
 local M = {}
 
---- Special tokens taken from https://huggingface.co/mlc-ai/mlc-chat-CodeLlama-13b-hf-q4f16_1/raw/main/tokenizer.json
---- and https://github.com/facebookresearch/codellama/blob/cb51c14ec761370ba2e2bc351374a79265d0465e/llama/tokenizer.py#L28
-local PRE = 32007
-local MID = 32009
-local SUF = 32008
-local BOS = 1
--- local EOS = 2
-
----@param handlers StreamHandlers
----@param params { context: { before: string, after: string } }  -- before and after context along with generation options: https://github.com/ggerganov/llama.cpp/tree/master/examples/server#api-endpoints
----@param options { url?: string } Url to running llamacpp server root (defaults to http://localhost:8080/)
-function M.request_completion(handlers, params, options)
-  local cancel = nil
-
-  local options_ = vim.tbl_extend('force', {
-    url = 'http://localhost:8080/',
-  }, options or {})
-
-  local function request_tokens(text, on_complete)
-    curl.request({
-      url = options_.url .. 'tokenize',
-      body = {
-        content = text,
-      },
-    }, function(response)
-      local data = util.json.decode(response)
-      if data == nil then
-        handlers.on_error('Failed to decode tokenizer response: ' .. response)
-        error('Failed to decode tokenizer response: ' .. response)
-        -- TODO probably want to add async error handling
-      end
-
-      on_complete(data.tokens)
-    end, handlers.on_error)
-  end
-
-  async(function(wait, resolve)
-    -- These rely on the fact that BOS is not added in tokenizer
-    -- https://github.com/ggerganov/llama.cpp/blob/c091cdfb24621710c617ea85c92fcd347d0bf340/examples/server/README.md?plain=1#L165
-    local pre_tokens = wait(request_tokens(params.context.before, resolve))
-    local suf_tokens = wait(request_tokens(params.context.after, resolve))
-
-    return {
-      pre = pre_tokens,
-      suf = suf_tokens,
-    }
-  end, function(tokens)
-    local prompt_tokens = vim.tbl_flatten({
-      -- Reference: https://github.com/facebookresearch/codellama/blob/cb51c14ec761370ba2e2bc351374a79265d0465e/llama/generation.py#L404
-      -- PSM format
-      BOS,
-      PRE,
-      tokens.pre,
-      SUF,
-      tokens.suf,
-      -- there might be additional magic here I'm not handling
-      -- https://github.com/facebookresearch/codellama/blob/cb51c14ec761370ba2e2bc351374a79265d0465e/llama/generation.py#L407
-      MID,
-    })
-
-    local completion = ''
-
-    cancel = curl.stream(
-      {
-        url = options_.url .. 'completion',
-        body = vim.tbl_extend('force', {
-          stream = true,
-          prompt = prompt_tokens,
-        }, util.table.without(params, 'context')),
-      },
-      provider_util.iter_sse_data(function(data)
-        local item = util.json.decode(data)
-
-        if item == nil then
-          handlers.on_error('Failed to decode: ' .. data)
-        elseif item.stop then
-          local strip_eot = completion:gsub(' <EOT>$', '') -- We can probably drop this eventually when llama.cpp adds the codellama special tokens (32010+)
-          handlers.on_finish(strip_eot)
-        else
-          completion = completion .. item.content
-          handlers.on_partial(item.content)
-        end
-      end),
-      util.eshow
-    )
-  end)
-
-  return function()
-    cancel()
-  end
-end
+local default_params = {
+  stream = true,
+}
 
 M.default_prompt = {
   provider = M,
-  mode = mode.INSERT, -- weird things happen if we have a visual selection
-  params = {
-    temperature = 0.1, -- Seems to rarely decode EOT if temp is high
-    top_p = 0.9,
-    n_predict = 256, -- Server seems to be ignoring this?
-    repeat_penalty = 1.2, -- infill really struggles with overgenerating
-  },
-  builder = function(_, context)
-    -- we ignore input since this is just for FIM
-    -- TODO figure out how to add instructions to FIM in Instruct models
+  mode = 'insert_or_replace',
+  builder = function(input)
     return {
-      context = prompts.limit_before_after(context, 30),
+      messages = {
+        {
+          role = 'user',
+          content = input,
+        },
+      },
     }
   end,
 }
+
+local function extract_chat_data(item)
+  local data = util.json.decode(item)
+
+  if data ~= nil and data.choices ~= nil then
+    return {
+      content = (data.choices[1].delta or {}).content,
+      finish_reason = data.choices[1].finish_reason,
+    }
+  end
+end
+
+---@deprecated Completion endpoints are pretty outdated
+local function extract_completion_data(item)
+  local data = util.json.decode(item)
+  if data ~= nil and data.choices ~= nil then
+    return {
+      content = (data.choices[1] or {}).text,
+      finish_reason = data.choices[1].finish_reason,
+    }
+  end
+end
+
+---@param handlers StreamHandlers
+---@param params? any Additional options for OpenAI endpoint
+---@param options? { url?: string, endpoint?: string, authorization?: string } Request endpoint and url. Defaults to 'https://api.openai.com/v1/' and 'chat/completions'. `authorization` overrides the request auth header. If url is provided the environment key will not be sent, you'll need to provide an authorization.
+function M.request_completion(handlers, params, options)
+  options = options or {}
+
+  local headers = { ['Content-Type'] = 'application/json' }
+
+  local endpoint = options.endpoint or 'chat/completions' -- TODO does this make compat harder?
+  local extract_data = endpoint == 'chat/completions' and extract_chat_data
+    or extract_completion_data
+
+  local completion = ''
+
+  return sse.curl_client({
+    headers = headers,
+    method = 'POST',
+    url = util.string.joinpath(
+      options.url or 'http://192.168.2.10:5000/v1/',
+      endpoint
+    ),
+    body = vim.tbl_deep_extend('force', default_params, params),
+  }, {
+    on_message = function(message, pending)
+      local data = extract_data(message.data)
+      utils.pt(data)
+
+      if data == nil then
+        if not message.data == '[DONE]' then
+          handlers.on_error(
+            vim.inspect({
+              data = message.data,
+              pending = pending,
+            }),
+            'Unrecognized SSE message data'
+          )
+        end
+      else
+        if data.content ~= nil then
+          completion = completion .. data.content
+          handlers.on_partial(data.content)
+        end
+
+        if data.finish_reason ~= nil then
+          handlers.on_finish(completion, data.finish_reason)
+        end
+      end
+    end,
+    on_other = function(content)
+      -- Non-SSE message likely means there was an error
+      handlers.on_error(content, 'OpenAI API error')
+    end,
+    on_error = handlers.on_error,
+  })
+end
+
+---@param standard_prompt StandardPrompt
+function M.adapt(standard_prompt)
+  return {
+    messages = util.table.flatten({
+      {
+        role = 'system',
+        content = standard_prompt.instruction,
+      },
+      standard_prompt.fewshot,
+      standard_prompt.messages,
+    }),
+  }
+end
+
+--- Sets default openai provider params. Currently enforces `stream = true`.
+function M.initialize(opts)
+  default_params = vim.tbl_deep_extend('force', default_params, opts or {}, {
+    stream = true, -- force streaming since data parsing will break otherwise
+  })
+end
+
+-- These are convenience exports for building prompt params specific to this provider
+M.prompt = {}
+
+function M.prompt.input_as_message(input)
+  return {
+    role = 'user',
+    content = input,
+  }
+end
+
+function M.prompt.add_args_as_last_message(messages, context)
+  if #context.args > 0 then
+    table.insert(messages, {
+      role = 'user',
+      content = context.args,
+    })
+  end
+
+  return messages
+end
+
+function M.prompt.input_and_args_as_messages(input, context)
+  return {
+    messages = M.add_args_as_last_message(M.input_as_message(input), context),
+  }
+end
+
+function M.prompt.with_system_message(text)
+  return function(input, context)
+    local body = M.input_and_args_as_messages(input, context)
+
+    table.insert(body.messages, 1, {
+      role = 'system',
+      content = text,
+    })
+
+    return body
+  end
+end
 
 return M

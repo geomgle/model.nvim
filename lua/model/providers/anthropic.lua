@@ -45,7 +45,7 @@ end
 
 ---@param handlers StreamHandlers
 ---@param params? any Additional options for OpenAI endpoint
----@param options? { url?: string, endpoint?: string, authorization?: string } Request endpoint and url. Defaults to 'https://api.openai.com/v1/' and 'chat/completions'. `authorization` overrides the request auth header. If url is provided the environment key will not be sent, you'll need to provide an authorization.
+---@param options? { url?: string, endpoint?: string, authorization?: string } Request endpoint and url. Defaults to 'https://api.anthropic.com/v1' and 'messages'. `authorization` overrides the request auth header. If url is provided the environment key will not be sent, you'll need to provide an authorization.
 function M.request_completion(handlers, params, options)
   options = options or {}
 
@@ -54,11 +54,6 @@ function M.request_completion(handlers, params, options)
     ['anthropic-version'] = '2023-06-01',
     ['Content-Type'] = 'application/json',
   }
-  if options.authorization then
-    headers.Authorization = options.authorization
-  elseif not options.url then -- only check the OpenAI env key if options.url wasn't set
-    headers.Authorization = 'Bearer ' .. util.env_memo('OPENAI_API_KEY')
-  end
 
   local endpoint = options.endpoint or 'messages' -- TODO does this make compat harder?
   local extract_data = endpoint == 'messages' and extract_chat_data
